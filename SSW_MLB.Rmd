@@ -1,0 +1,628 @@
+---
+title: "SSW_MLB"
+author: "Colin Hofmeister"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(xgboost)
+library(dplyr)
+```
+
+```{r}
+# 1. Load the Data
+# Change this filename to whatever file you downloaded (e.g., "combined_postseason_data.csv")
+df <- read_csv("mlb_2025_season_andPost.csv", show_col_types = FALSE) %>%
+  filter(!is.na(pfx_x), !is.na(pfx_z), !is.na(spin_axis))
+
+df_24 <- read_csv("mlb_2024_season.csv", show_col_types = FALSE) %>%
+  filter(!is.na(pfx_x), !is.na(pfx_z), !is.na(spin_axis))
+
+# =======================================================
+#   1. DATA SETUP (Standard Physics Definitions)
+# =======================================================
+
+
+ssw_data <- df %>%
+  mutate(
+    # Y-AXIS DATA: What the Camera sees (Spin)
+    Observed_Axis = spin_axis, 
+    
+    # X-AXIS DATA: What the Movement implies
+    Raw_Angle = (180 + atan2(-pfx_x, pfx_z) * 180 / pi) %% 360,
+    
+    # Hemisphere Check
+    Inferred_Axis = ifelse(abs(Raw_Angle - Observed_Axis) > 90, 
+                           (Raw_Angle + 180) %% 360, 
+                           Raw_Angle),
+    
+    # Deviation Calculation
+    SSW_Deviation = Inferred_Axis - Observed_Axis
+  )
+
+
+ssw_data_24 <- df_24 %>%
+  mutate(
+    # Y-AXIS DATA: What the Camera sees (Spin)
+    Observed_Axis = spin_axis, 
+    
+    # X-AXIS DATA: What the Movement implies
+    Raw_Angle = (180 + atan2(-pfx_x, pfx_z) * 180 / pi) %% 360,
+    
+    # Hemisphere Check
+    Inferred_Axis = ifelse(abs(Raw_Angle - Observed_Axis) > 90, 
+                           (Raw_Angle + 180) %% 360, 
+                           Raw_Angle),
+    
+    # Deviation Calculation
+    SSW_Deviation = Inferred_Axis - Observed_Axis
+  )
+
+# =======================================================
+#   2. THE PLOT: SWAPPED AXES
+# =======================================================
+
+ggplot(ssw_data %>% filter(pitch_name %in% c("Sinker", "Changeup", "4-Seam Fastball")), 
+       # --- THE SWAP IS HERE ---
+       aes(x = Inferred_Axis, y = Observed_Axis, color = pitch_name)) + 
+  
+  # The "Line of Truth"
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed", linewidth = 1) +
+  
+  geom_point(alpha = 0.5, size = 3) + 
+  
+  scale_x_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  scale_y_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  coord_fixed() +
+  theme_minimal() +
+  
+  labs(
+    title = "Seam-Shifted Wake: Observed vs. Inferred",
+    # IMPORTANT: With Inferred on X, 'More Movement' means X > Y, so dots drop BELOW the line.
+    subtitle = "Dots BELOW the line = Movement > Spin (Sinker Effect)",
+    
+    x = "Inferred Axis (Movement / PFX)",    # X-AXIS
+    y = "Observed Axis (Camera / Spin)",     # Y-AXIS
+    color = "Pitch Type"
+  )
+```
+
+```{r}
+# Assuming you already ran the previous 'ssw_data' code...
+
+# Create the "Insight" Column
+analyzed_data <- ssw_data %>%
+  mutate(
+    Insight = case_when(
+      # Case 1: The Elite Sinker (Good SSW)
+      pitch_name == "Sinker" & SSW_Deviation > 15 ~ "ELITE: Seams are creating extra sink/run.",
+      pitch_name == "Sinker" & abs(SSW_Deviation) < 5 ~ "AVERAGE: Movement is purely from spin. Could improve.",
+      
+      # Case 2: The Inefficient Fastball (Bad SSW / Cut)
+      # (Assuming RHP for simplicity; logic flips for LHP)
+      pitch_name == "4-Seam Fastball" & abs(SSW_Deviation) > 15 ~ "WARNING: Accidental Cut/Inefficiency detected.",
+      pitch_name == "4-Seam Fastball" & abs(SSW_Deviation) < 5 ~ "ELITE: Pure Backspin efficiency.",
+      
+      # Case 3: The 'Disappearing' Changeup
+      pitch_name == "Changeup" & SSW_Deviation > 20 ~ "UNICORN: Massive non-Magnus fade.",
+      
+      TRUE ~ "Standard Movement"
+    )
+  )
+
+# --- REPORT CARD GENERATOR ---
+# Let's look at a specific player's repertoire to see the insights
+player_report <- analyzed_data %>%
+  filter(player_name == "Holmes, Clay") %>% # Change to any pitcher
+  group_by(pitch_name) %>%
+  summarise(
+    Pitches = n(),
+    Avg_Spin_Axis = round(mean(spin_axis, na.rm=TRUE), 0),
+    Avg_Observed_Axis = round(mean(Observed_Axis, na.rm=TRUE), 0),
+    Avg_Deviation = round(mean(SSW_Deviation, na.rm=TRUE), 1),
+    # Get the most common Insight for this pitch
+    Dominant_Insight = names(which.max(table(Insight)))
+  ) %>%
+  arrange(desc(Pitches))
+
+print(player_report)
+```
+
+```{r}
+# =======================================================
+#   STEP 1: IDENTIFY THE "ALREADY HAS SINKER" LIST
+# =======================================================
+already_throws_sinker <- ssw_data %>%
+  filter(pitch_name == "Sinker") %>%
+  pull(player_name) %>%
+  unique()
+
+# =======================================================
+#   STEP 2: TRAIN MODEL (On Sinker Data)
+# =======================================================
+# We want to learn: "What does an Elite Sinker release look like?"
+# Constraint: We CANNOT use Velocity or Spin Rate as features, 
+# because we will be testing this on Changeups (which are slower).
+# We rely on Geometry (Release Point) and Spin Axis.
+
+train_data <- ssw_data %>%
+  filter(pitch_name == "Sinker") %>%
+  filter(!is.na(release_pos_x), !is.na(release_pos_z), !is.na(release_extension), !is.na(spin_axis)) %>%
+  mutate(
+    # Target: Elite Sinker (>15 deg deviation)
+    Is_Elite_Sinker = ifelse(abs(SSW_Deviation) > 15, 1, 0),
+    Is_LHP = ifelse(p_throws == "L", 1, 0)
+  )
+
+# Features: Geometry Only
+train_matrix <- as.matrix(train_data %>% select(
+  release_pos_z,      # Height
+  release_pos_x,      # Side
+  release_extension,  # Extension
+  spin_axis,          # Axis (Crucial: CH and SI often share axis)
+  Is_LHP
+))
+
+train_labels <- train_data$Is_Elite_Sinker
+
+# Train the "Sinker Geometry" Model
+geom_model <- xgboost(
+  data = train_matrix, 
+  label = train_labels,
+  max.depth = 4,
+  eta = 0.1,
+  nrounds = 50,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+# =======================================================
+#   STEP 3: TEST ON CHANGEUP THROWERS (Who don't Sinker)
+# =======================================================
+
+# 1. Filter for Changeups
+# 2. Exclude pitchers who already throw a sinker
+ch_candidates <- ssw_data %>%
+  filter(pitch_name == "Changeup") %>%
+  filter(!player_name %in% already_throws_sinker) %>%
+  filter(!is.na(release_pos_x), !is.na(release_pos_z), !is.na(release_extension), !is.na(spin_axis)) %>%
+  mutate(Is_LHP = ifelse(p_throws == "L", 1, 0))
+
+# 3. Predict: "Does this Changeup's release geometry look like an Elite Sinker?"
+candidate_matrix <- as.matrix(ch_candidates %>% select(
+  release_pos_z, 
+  release_pos_x, 
+  release_extension, 
+  spin_axis,
+  Is_LHP
+))
+
+ch_candidates$Sinker_Shape_Score = predict(geom_model, candidate_matrix)
+
+# =======================================================
+#   STEP 4: RANK THE "GOLDEN" CANDIDATES
+# =======================================================
+
+golden_candidates <- ch_candidates %>%
+  group_by(player_name) %>%
+  summarise(
+    # Renaming variables here
+    `2025_CH_thrown` = n(),                   # Was "Pitches"
+    Avg_CH_Deviation = mean(abs(SSW_Deviation)),
+    Sinker_Fit_Score = mean(Sinker_Shape_Score) * 100,
+    Avg_CH_Velo = mean(release_speed)         # Was "Avg_Velo"
+  ) %>%
+  filter(`2025_CH_thrown` > 50) %>%
+  
+  # THE GOLDEN FILTER:
+  filter(Avg_CH_Deviation > 15, Sinker_Fit_Score > 60) %>%
+  
+  # REORDER COLUMNS
+  # 1. Name -> 2. Fit Score -> [Middle Cols] -> Last: Count
+  select(player_name, Sinker_Fit_Score, Avg_CH_Deviation, Avg_CH_Velo, `2025_CH_thrown`) %>%
+  
+  arrange(desc(Avg_CH_Deviation)) 
+
+# =======================================================
+#   STEP 5: VIEW RESULTS
+# =======================================================
+
+print("--- THE 'SECRET SINKER' CANDIDATES ---")
+print("These pitchers don't throw a Sinker, but their Changeup proves they have the SSW skill:")
+print(head(golden_candidates, 15))
+```
+
+
+```{r}
+# =======================================================
+#   JHOAN DURAN: 4-SEAM FASTBALL (Swapped Axes)
+# =======================================================
+
+duran_data <- ssw_data %>%
+  filter(player_name == "Duran, Jhoan") %>%
+  filter(pitch_name == "4-Seam Fastball")
+
+duran_stats <- duran_data %>%
+  summarise(
+    Avg_Velo = round(mean(release_speed, na.rm = TRUE), 1),
+    Avg_Deviation = round(mean(SSW_Deviation, na.rm = TRUE), 1)
+  )
+
+ggplot(duran_data, aes(x = Inferred_Axis, y = Observed_Axis)) +  # SWAPPED
+  
+  geom_abline(slope = 1, intercept = 0, color = "#555555", linetype = "longdash", linewidth = 0.8, alpha = 0.5) +
+  
+  geom_point(
+    shape = 21,
+    fill = "#004687",
+    color = "white",
+    stroke = 0.5,
+    size = 4, 
+    alpha = 0.75
+  ) +
+  
+  scale_x_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  scale_y_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  coord_fixed() +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 12, color = "grey30", margin = margin(b = 15)),
+    plot.caption = element_text(size = 10, color = "grey40", hjust = 0, margin = margin(t = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#E5E5E5"),
+    axis.title = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "grey20")
+  ) +
+  
+  labs(
+    title = "Jhoan Duran: 4-Seam Fastball",
+    subtitle = paste0("Avg SSW Deviation: ", duran_stats$Avg_Deviation, "°"),
+    x = "Inferred Axis",   # X-AXIS
+    y = "Observed Axis",    # Y-AXIS
+    caption = "Dots on the line = No SSW (Pure Magnus)"
+  )
+```
+
+
+```{r}
+# =======================================================
+#   FIXED & POLISHED: Clay Holmes Sinker Plot
+# =======================================================
+holmes_data <- ssw_data %>%
+  filter(player_name == "Holmes, Clay") %>%
+  filter(pitch_name == "Sinker")
+
+holmes_stats <- holmes_data %>%
+  summarise(
+    Avg_Velo = round(mean(release_speed, na.rm = TRUE), 1),
+    Avg_Deviation = round(mean(SSW_Deviation, na.rm = TRUE), 1)
+  )
+
+ggplot(holmes_data, aes(x = Inferred_Axis, y = Observed_Axis)) +  # SWAPPED
+  
+  geom_abline(slope = 1, intercept = 0, color = "#555555", linetype = "longdash", linewidth = 0.8, alpha = 0.5) +
+  
+  geom_point(
+    shape = 21,
+    fill = "#004687",
+    color = "white",
+    stroke = 0.5,
+    size = 4, 
+    alpha = 0.75
+  ) +
+  
+  scale_x_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  scale_y_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  coord_fixed() +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 12, color = "grey30", margin = margin(b = 15)),
+    plot.caption = element_text(size = 10, color = "grey40", hjust = 0, margin = margin(t = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#E5E5E5"),
+    axis.title = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "grey20")
+  ) +
+  
+  labs(
+    title = "Clay Holmes: Sinker",
+    subtitle = paste0("Avg SSW Deviation: ", holmes_stats$Avg_Deviation, "°"),
+    x = "Inferred Axis",   # X-AXIS
+    y = "Observed Axis",    # Y-AXIS
+    caption = "Dots BELOW line = Ball Sinking MORE than expected (SSW)"
+  )
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# =======================================================
+#   CLAY HOLMES: SINKER & CHANGEUP (Swapped Axes)
+# =======================================================
+
+holmes_combo <- ssw_data %>%
+  filter(player_name == "Holmes, Clay") %>%
+  filter(pitch_name %in% c("Sinker", "Changeup")) %>%
+  filter(!is.na(Observed_Axis), !is.na(Inferred_Axis))
+
+holmes_stats_combo <- holmes_combo %>%
+  group_by(pitch_name) %>%
+  summarise(
+    Avg_Dev = round(mean(abs(SSW_Deviation), na.rm = TRUE), 1)
+  )
+
+h_si_dev <- holmes_stats_combo$Avg_Dev[holmes_stats_combo$pitch_name == "Sinker"]
+h_ch_dev <- holmes_stats_combo$Avg_Dev[holmes_stats_combo$pitch_name == "Changeup"]
+
+ggplot(holmes_combo, aes(x = Inferred_Axis, y = Observed_Axis, fill = pitch_name)) + # SWAPPED
+  
+  geom_abline(slope = 1, intercept = 0, color = "#555555", linetype = "longdash", linewidth = 0.8, alpha = 0.5) +
+  
+  geom_point(
+    shape = 21,
+    color = "white",
+    stroke = 0.3,
+    size = 4, 
+    alpha = 0.75
+  ) +
+  
+  scale_fill_manual(values = c("Sinker" = "#004687", "Changeup" = "#D64B4B")) +
+  
+  scale_x_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  scale_y_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  coord_fixed() +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 12, color = "grey30", margin = margin(b = 15)),
+    plot.caption = element_text(size = 10, color = "grey40", hjust = 0, margin = margin(t = 10)),
+    legend.position = "right", 
+    legend.title = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#E5E5E5"),
+    axis.title = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "grey20")
+  ) +
+  
+  labs(
+    title = "Clay Holmes: Sinker & Changeup",
+    subtitle = paste0("SSW Deviation: Sinker ", h_si_dev, "° | Changeup ", h_ch_dev, "°"),
+    x = "Inferred Axis",
+    y = "Observed Axis",
+    caption = "Dots BELOW line = Movement > Spin (Sinker Effect)",
+    fill = "Pitch Type"
+  )
+
+# =======================================================
+#   LOGAN WEBB: SINKER & CHANGEUP (Swapped Axes)
+# =======================================================
+
+webb_combo <- ssw_data %>%
+  filter(player_name == "Webb, Logan") %>%
+  filter(pitch_name %in% c("Sinker", "Changeup")) %>%
+  filter(!is.na(Observed_Axis), !is.na(Inferred_Axis))
+
+webb_stats_combo <- webb_combo %>%
+  group_by(pitch_name) %>%
+  summarise(
+    Avg_Dev = round(mean(abs(SSW_Deviation), na.rm = TRUE), 1)
+  )
+
+w_si_dev <- webb_stats_combo$Avg_Dev[webb_stats_combo$pitch_name == "Sinker"]
+w_ch_dev <- webb_stats_combo$Avg_Dev[webb_stats_combo$pitch_name == "Changeup"]
+
+ggplot(webb_combo, aes(x = Inferred_Axis, y = Observed_Axis, fill = pitch_name)) + # SWAPPED
+  
+  geom_abline(slope = 1, intercept = 0, color = "#555555", linetype = "longdash", linewidth = 0.8, alpha = 0.5) +
+  
+  geom_point(
+    shape = 21,
+    color = "white",
+    stroke = 0.3,
+    size = 4, 
+    alpha = 0.75
+  ) +
+  
+  scale_fill_manual(values = c("Sinker" = "#004687", "Changeup" = "#D64B4B")) +
+  
+  scale_x_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  scale_y_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  coord_fixed() +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 12, color = "grey30", margin = margin(b = 15)),
+    plot.caption = element_text(size = 10, color = "grey40", hjust = 0, margin = margin(t = 10)),
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#E5E5E5"),
+    axis.title = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "grey20")
+  ) +
+  
+  labs(
+    title = "Logan Webb: Sinker & Changeup",
+    subtitle = paste0("SSW Deviation: Sinker ", w_si_dev, "° | Changeup ", w_ch_dev, "°"),
+    x = "Inferred Axis",
+    y = "Observed Axis",
+    caption = "Dots BELOW line = Movement > Spin (Sinker Effect)",
+    fill = "Pitch Type"
+  )
+
+```
+
+```{r}
+# =======================================================
+#   YARAMIL HIRALDO: ALL PITCHES
+# =======================================================
+
+# 1. Filter Data
+hiraldo_data <- ssw_data %>%
+  filter(player_name == "Festa, David") %>%
+    filter(pitch_name %in% c("Sinker")) %>%
+  filter(!is.na(Observed_Axis), !is.na(Inferred_Axis))
+
+# 2. Calculate Stats per Pitch Type (for the subtitle)
+hiraldo_stats <- hiraldo_data %>%
+  group_by(pitch_name) %>%
+  summarise(
+    Count = n(),
+    Avg_Dev = round(mean(abs(SSW_Deviation), na.rm = TRUE), 1)
+  ) %>%
+  arrange(desc(Count))
+
+# Create a label string for the top 3 pitches to put in the subtitle
+top_pitches <- head(hiraldo_stats, 3)
+
+# 3. Plot
+ggplot(hiraldo_data, aes(x = Inferred_Axis, y = Observed_Axis, fill = pitch_name)) +
+  
+  # The "Line of Truth"
+  geom_abline(slope = 1, intercept = 0, color = "#555555", linetype = "longdash", linewidth = 0.8, alpha = 0.5) +
+  
+  # The Pitches
+  geom_point(
+    shape = 21,          # Filled circle with border
+    color = "white",     # White border
+    stroke = 0.3,        
+    size = 4, 
+    alpha = 0.8
+  ) +
+  
+  # Dynamic Color Palette (Handles any number of pitch types)
+  scale_fill_brewer(palette = "Set1") + 
+  
+  # Scales
+  scale_x_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  scale_y_continuous(limits = c(0, 360), breaks = seq(0, 360, 90)) +
+  coord_fixed() +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 11, color = "grey30", margin = margin(b = 15)),
+    plot.caption = element_text(size = 10, color = "grey40", hjust = 0, margin = margin(t = 10)),
+    
+    legend.position = "right", 
+    legend.title = element_text(face = "bold", size = 12),
+    
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#E5E5E5"),
+    axis.title = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "grey20")
+  ) +
+  
+  labs(
+    title = "David Festa: 2025 Sinker",
+    x = "Inferred Axis (Movement / PFX)",   # X-AXIS
+    y = "Observed Axis (Camera / Spin)",    # Y-AXIS
+    caption = "Data: MLB 2025 | Dots off line = Movement > Spin (SSW)",
+    fill = "Pitch Type"
+  )
+```
+
+```{r}
+# =======================================================
+#   STEP 1: IDENTIFY THE "ALREADY HAS SINKER" LIST (2024)
+# =======================================================
+already_throws_sinker_24 <- ssw_data_24 %>%
+  filter(pitch_name == "Sinker") %>%
+  pull(player_name) %>%
+  unique()
+
+# =======================================================
+#   STEP 2: TRAIN MODEL (On 2024 Sinker Data)
+# =======================================================
+# Goal: Learn "Elite Sinker Geometry" from 2024 pitchers
+
+train_data_24 <- ssw_data_24 %>%
+  filter(pitch_name == "Sinker") %>%
+  filter(!is.na(release_pos_x), !is.na(release_pos_z), !is.na(release_extension), !is.na(spin_axis)) %>%
+  mutate(
+    # Target: Elite Sinker (>15 deg deviation)
+    Is_Elite_Sinker = ifelse(abs(SSW_Deviation) > 15, 1, 0),
+    Is_LHP = ifelse(p_throws == "L", 1, 0)
+  )
+
+# Features: Geometry Only
+train_matrix_24 <- as.matrix(train_data_24 %>% select(
+  release_pos_z,      # Height
+  release_pos_x,      # Side
+  release_extension,  # Extension
+  spin_axis,          # Axis
+  Is_LHP
+))
+
+train_labels_24 <- train_data_24$Is_Elite_Sinker
+
+# Train the "Sinker Geometry" Model
+geom_model_24 <- xgboost(
+  data = train_matrix_24, 
+  label = train_labels_24,
+  max.depth = 4,
+  eta = 0.1,
+  nrounds = 50,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+# =======================================================
+#   STEP 3: TEST ON CHANGEUP THROWERS (Who don't Sinker)
+# =======================================================
+
+# 1. Filter for Changeups in 2024
+# 2. Exclude pitchers who already threw a sinker in 2024
+ch_candidates_24 <- ssw_data_24 %>%
+  filter(pitch_name == "Changeup") %>%
+  filter(!player_name %in% already_throws_sinker_24) %>%
+  filter(!is.na(release_pos_x), !is.na(release_pos_z), !is.na(release_extension), !is.na(spin_axis)) %>%
+  mutate(Is_LHP = ifelse(p_throws == "L", 1, 0))
+
+# 3. Predict: "Does this Changeup's release geometry look like an Elite Sinker?"
+candidate_matrix_24 <- as.matrix(ch_candidates_24 %>% select(
+  release_pos_z, 
+  release_pos_x, 
+  release_extension, 
+  spin_axis,
+  Is_LHP
+))
+
+ch_candidates_24$Sinker_Shape_Score = predict(geom_model_24, candidate_matrix_24)
+
+# =======================================================
+#   STEP 4: RANK THE "GOLDEN" CANDIDATES
+# =======================================================
+
+golden_candidates_24 <- ch_candidates_24 %>%
+  group_by(player_name) %>%
+  summarise(
+    # Renaming variables here
+    `2024_CH_thrown` = n(),                   # Was "Pitches"
+    Avg_CH_Deviation = mean(abs(SSW_Deviation)),
+    Sinker_Fit_Score = mean(Sinker_Shape_Score) * 100,
+    Avg_CH_Velo = mean(release_speed)         # Was "Avg_Velo"
+  ) %>%
+  filter(`2024_CH_thrown` > 50) %>%
+  
+  # THE GOLDEN FILTER:
+  filter(Avg_CH_Deviation > 15, Sinker_Fit_Score > 60) %>%
+  
+  # REORDER COLUMNS
+  # 1. Name -> 2. Fit Score -> [Middle Cols] -> Last: Count
+  select(player_name, Sinker_Fit_Score, Avg_CH_Deviation, Avg_CH_Velo, `2024_CH_thrown`) %>%
+  
+  arrange(desc(Avg_CH_Deviation)) 
+```
+
